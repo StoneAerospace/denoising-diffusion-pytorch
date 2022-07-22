@@ -9,7 +9,7 @@ from functools import partial
 import cv2
 import os
 
-from bathymetry_utils.analysis import running_mean, plot_im_list
+from bathymetry_utils.analysis import running_mean
 
 import os
 import time 
@@ -31,7 +31,7 @@ from ddrm_codes_2.functions.svd_replacement import Denoising
 import matplotlib.pyplot as plt
 import pandas as pd
 
-from tqdm.auto import tqdm
+from tqdm import tqdm
 from einops import rearrange
 
 # helpers functions
@@ -308,8 +308,6 @@ class Unet(nn.Module):
         )
 
     def forward(self, x, time):
-        """ This function is going to start with x_t and attempt to predict x_(t-1) (I think)
-        """
         x = self.init_conv(x)
 
         t = self.time_mlp(time) if exists(self.time_mlp) else None
@@ -345,8 +343,8 @@ class Unet(nn.Module):
 
 def extract(a, t, x_shape):
     b, *_ = t.shape
-    out = a.gather(-1, t) # gathers values along last dimension indexed by t vector; not sure why they do this and not just out = a[t]?
-    return out.reshape(b, *((1,) * (len(x_shape) - 1))) # we want this to have shape (batch_size, 1, ..., 1); the number of ones should be the same number of dimensions as x_shape - 1
+    out = a.gather(-1, t)
+    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
 def noise_like(shape, device, repeat=False):
     repeat_noise = lambda: torch.randn((1, *shape[1:]), device=device).repeat(shape[0], *((1,) * (len(shape) - 1)))
@@ -400,7 +398,7 @@ class GaussianDiffusion(nn.Module):
 
         alphas = 1. - betas
         alphas_cumprod = torch.cumprod(alphas, axis=0)
-        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value = 1.) # this is same as above, but just one value before alphahat_(t-1)
+        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value = 1.)
 
         timesteps, = betas.shape
         self.num_timesteps = int(timesteps)
@@ -424,7 +422,7 @@ class GaussianDiffusion(nn.Module):
 
         # calculations for posterior q(x_{t-1} | x_t, x_0)
 
-        posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod) # Equation 10 in Nichol et. al 2021
+        posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
 
         # above: equal to 1. / (1. / (1. - alpha_cumprod_tm1) + alpha_t / beta_t)
 
@@ -436,18 +434,18 @@ class GaussianDiffusion(nn.Module):
         register_buffer('posterior_mean_coef1', betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
         register_buffer('posterior_mean_coef2', (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod))
 
-    def predict_start_from_noise(self, x_t, t, noise): # Same as Equation 9 in Nichol et. al 2021 re-arranged to solve for x_0
+    def predict_start_from_noise(self, x_t, t, noise):
         return (
             extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
             extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
         )
 
     def q_posterior(self, x_start, x_t, t):
-        posterior_mean = ( # this refers to equation 11 in Nichol et. al 2021; trying to obtain x_(t-1)
+        posterior_mean = (
             extract(self.posterior_mean_coef1, t, x_t.shape) * x_start +
             extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
         )
-        posterior_variance = extract(self.posterior_variance, t, x_t.shape) # Equation 10 in Nichol et al 2021
+        posterior_variance = extract(self.posterior_variance, t, x_t.shape)
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
@@ -523,7 +521,7 @@ class GaussianDiffusion(nn.Module):
 
             if plot_flag:
                 if not i%10:
-                    plot_im_list(img.cpu()[:,0]);plt.show(block=False);plt.waitforbuttonpress();plt.close('all')
+                    plt.imshow(img[0].cpu()[0,:,:],vmin=0,vmax=1);plt.show(block=False);plt.waitforbuttonpress()
 
             if output_folder is not None:
                 if not i%10: # save every 10th sample
@@ -535,29 +533,6 @@ class GaussianDiffusion(nn.Module):
 
         img = unnormalize_to_zero_to_one(img) # This is included so that the image sample can be saved and not have any colors clipped I believe
         return img
-
-    @torch.no_grad()
-    def my_sample(self, shape):
-        self.device = self.betas.device
-        x = torch.randn(shape).to(self.device)
-        n = shape[0]
-        for i in tqdm(reversed(range(1, self.num_timesteps)), position=0):
-            t = (torch.ones(n) * i).long().to(self.device)
-            predicted_noise = self.denoise_fn(x, t)
-            beta = extract(self.betas, t, x.shape)
-            alpha_hat = extract(self.alphas_cumprod, t, x.shape)
-            alpha = 1. - beta
-            if i > 1:
-                noise = torch.randn_like(x)
-            else:
-                noise = torch.zeros_like(x)
-            x = 1 / torch.sqrt(alpha) * (x - ((1 - alpha) / (torch.sqrt(1 - alpha_hat))) * predicted_noise) + torch.sqrt(beta) * noise
-            x = x.clamp(-1., 1.)
-
-            # if i % 20 == 0:
-            #     plot_im_list(x.cpu()[:,0])
-            
-        return x.add(1).mul(0.5)
 
     @torch.no_grad()
     def p_sample_step(self, shape, clip_denoised, t, img, mask, plot_flag=False,output_folder=None):
@@ -642,15 +617,14 @@ class GaussianDiffusion(nn.Module):
         eta = 1 # default
         cls_fn = None # default
         classes = None # default
-        pred_noise = True if self.objective=='pred_noise' else False
 
         print('\n\n Sampling using DDRM... \n\n')
 
-        out = efficient_generalized_steps(x, seq, model, pred_noise, betas, H_funcs, y_0, sigma_0, \
+        out = efficient_generalized_steps(x, seq, model, betas, H_funcs, y_0, sigma_0, \
             etaB=etaB, etaA=eta, etaC=eta, cls_fn=cls_fn, classes=classes)
         new_sample = out[0][-1]
 
-        return new_sample
+        return unnormalize_to_zero_to_one(new_sample)
 
     @torch.no_grad()
     def ddrm_PSNR(self, images, ext, ddrm_steps = 20, deg='sr', out_folder=None):
@@ -671,7 +645,6 @@ class GaussianDiffusion(nn.Module):
         eta = 1 # default
         cls_fn = None # default
         classes = None # default
-        pred_noise = True if self.objective=='pred_noise' else False
 
         # load the SR object from ddrm module
         if 'sr' in deg:
@@ -691,7 +664,7 @@ class GaussianDiffusion(nn.Module):
         y_0 = H_funcs.H(images)
         x = torch.randn((batch_size,channels,image_size,image_size)).to(device=device)
 
-        out = efficient_generalized_steps(x, seq, model, pred_noise, betas, H_funcs, y_0, sigma_0, \
+        out = efficient_generalized_steps(x, seq, model, betas, H_funcs, y_0, sigma_0, \
             etaB=etaB, etaA=eta, etaC=eta, cls_fn=cls_fn, classes=classes)
         new_sample = out[0][-1]
 
@@ -730,11 +703,11 @@ class GaussianDiffusion(nn.Module):
         return img
 
     def q_sample(self, x_start, t, noise=None):
-        noise = default(noise, lambda: torch.randn_like(x_start)) # x_start is x_0 in the paper (I think)
+        noise = default(noise, lambda: torch.randn_like(x_start))
 
-        return ( # this is related to equation 4 in the paper, DDPM Ho et. al 2020; equation 9 in Nichol et. al 2021
-            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start + # [batch_size, 1 , 1, 1] x [batch_size, C, X, Y]
-            extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise # [batch_size, 1, 1, 1] x [batch_size, C, X, Y]
+        return (
+            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
+            extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
     @property
@@ -750,7 +723,7 @@ class GaussianDiffusion(nn.Module):
         b, c, h, w = x_start.shape
         noise = default(noise, lambda: torch.randn_like(x_start))
 
-        x = self.q_sample(x_start=x_start, t=t, noise=noise) # returns x_t given x_0 (equation 4 in Ho et. al 2020)
+        x = self.q_sample(x_start=x_start, t=t, noise=noise)
         model_out = self.denoise_fn(x, t)
 
         if self.objective == 'pred_noise':
@@ -768,9 +741,7 @@ class GaussianDiffusion(nn.Module):
         assert h == img_size and w == img_size, f'height and width of image must be {img_size}'
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
-        if int(img.min()) == 0 and int(img.max() == 1):
-            img = normalize_to_neg_one_to_one(img)
-
+        img = normalize_to_neg_one_to_one(img)
         return self.p_losses(img, t, *args, **kwargs)
 
 # dataset classes
@@ -782,22 +753,13 @@ class Dataset(data.Dataset):
         self.image_size = image_size
         self.paths = [p for ext in exts for p in Path(f'{folder}').glob(f'**/*.{ext}')]
 
-
-        if 'npy' in exts[0]:
-            self.transform = transforms.Compose([
-                    transforms.ToPILImage(),
-                    transforms.Resize(image_size),
-                    transforms.RandomHorizontalFlip(),
-                    transforms.CenterCrop(image_size),
-                    transforms.ToTensor()
-                ])
-        else:
-            self.transform = transforms.Compose([
-                    transforms.Resize(image_size),
-                    transforms.RandomHorizontalFlip(),
-                    transforms.CenterCrop(image_size),
-                    transforms.ToTensor()
-                ])
+        self.transform = transforms.Compose([
+                transforms.ToPILImage(),
+                transforms.Resize(image_size),
+                transforms.RandomHorizontalFlip(),
+                transforms.CenterCrop(image_size),
+                transforms.ToTensor()
+            ])
 
     def __len__(self):
         return len(self.paths)

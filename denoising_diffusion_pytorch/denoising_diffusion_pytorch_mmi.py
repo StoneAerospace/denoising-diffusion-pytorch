@@ -9,7 +9,7 @@ from functools import partial
 import cv2
 import os
 
-from bathymetry_utils.analysis import running_mean, plot_im_list
+from bathymetry_utils.analysis import running_mean, plot_im_list, quantize, psnr
 
 import os
 import time 
@@ -88,19 +88,19 @@ class Residual(nn.Module):
     def forward(self, x, *args, **kwargs):
         return self.fn(x, *args, **kwargs) + x
 
-class SinusoidalPosEmb(nn.Module):
+class SinusoidalPositionEmbeddings(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
 
-    def forward(self, x):
-        device = x.device
+    def forward(self, time):
+        device = time.device
         half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = x[:, None] * emb[None, :]
-        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
-        return emb
+        embeddings = math.log(10000) / (half_dim - 1)
+        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
+        embeddings = time[:, None] * embeddings[None, :]
+        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
+        return embeddings
 
 def Upsample(dim):
     return nn.ConvTranspose2d(dim, dim, 4, 2, 1)
@@ -151,125 +151,172 @@ class Block(nn.Module):
         return x
 
 class ResnetBlock(nn.Module):
-    def __init__(self, dim, dim_out, *, time_emb_dim = None, groups = 8):
+    """https://arxiv.org/abs/1512.03385"""
+    
+    def __init__(self, dim, dim_out, *, time_emb_dim=None, groups=8):
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(time_emb_dim, dim_out * 2)
-        ) if exists(time_emb_dim) else None
+        self.mlp = (
+            nn.Sequential(nn.SiLU(), nn.Linear(time_emb_dim, dim_out))
+            if exists(time_emb_dim)
+            else None
+        )
 
-        self.block1 = Block(dim, dim_out, groups = groups)
-        self.block2 = Block(dim_out, dim_out, groups = groups)
+        self.block1 = Block(dim, dim_out, groups=groups)
+        self.block2 = Block(dim_out, dim_out, groups=groups)
         self.res_conv = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
-    def forward(self, x, time_emb = None):
+    def forward(self, x, time_emb=None):
+        h = self.block1(x)
 
-        scale_shift = None
         if exists(self.mlp) and exists(time_emb):
             time_emb = self.mlp(time_emb)
-            time_emb = rearrange(time_emb, 'b c -> b c 1 1')
-            scale_shift = time_emb.chunk(2, dim = 1)
-
-        h = self.block1(x, scale_shift = scale_shift)
+            h = rearrange(time_emb, "b c -> b c 1 1") + h
 
         h = self.block2(h)
         return h + self.res_conv(x)
 
-class LinearAttention(nn.Module):
-    def __init__(self, dim, heads = 4, dim_head = 32):
-        super().__init__()
-        self.scale = dim_head ** -0.5
-        self.heads = heads
-        hidden_dim = dim_head * heads
-        self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias = False)
+class ConvNextBlock(nn.Module):
+    """https://arxiv.org/abs/2201.03545"""
 
-        self.to_out = nn.Sequential(
-            nn.Conv2d(hidden_dim, dim, 1),
-            LayerNorm(dim)
+    def __init__(self, dim, dim_out, *, time_emb_dim=None, mult=2, norm=True):
+        super().__init__()
+        self.mlp = (
+            nn.Sequential(nn.GELU(), nn.Linear(time_emb_dim, dim))
+            if exists(time_emb_dim)
+            else None
         )
 
-    def forward(self, x):
-        b, c, h, w = x.shape
-        qkv = self.to_qkv(x).chunk(3, dim = 1)
-        q, k, v = map(lambda t: rearrange(t, 'b (h c) x y -> b h c (x y)', h = self.heads), qkv)
+        self.ds_conv = nn.Conv2d(dim, dim, 7, padding=3, groups=dim)
 
-        q = q.softmax(dim = -2)
-        k = k.softmax(dim = -1)
+        self.net = nn.Sequential(
+            nn.GroupNorm(1, dim) if norm else nn.Identity(),
+            nn.Conv2d(dim, dim_out * mult, 3, padding=1),
+            nn.GELU(),
+            nn.GroupNorm(1, dim_out * mult),
+            nn.Conv2d(dim_out * mult, dim_out, 3, padding=1),
+        )
 
-        q = q * self.scale
-        context = torch.einsum('b h d n, b h e n -> b h d e', k, v)
+        self.res_conv = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
-        out = torch.einsum('b h d e, b h d n -> b h e n', context, q)
-        out = rearrange(out, 'b h c (x y) -> b (h c) x y', h = self.heads, x = h, y = w)
-        return self.to_out(out)
+    def forward(self, x, time_emb=None):
+        h = self.ds_conv(x)
+
+        if exists(self.mlp) and exists(time_emb):
+            assert exists(time_emb), "time embedding must be passed in"
+            condition = self.mlp(time_emb)
+            h = h + rearrange(condition, "b c -> b c 1 1")
+
+        h = self.net(h)
+        return h + self.res_conv(x)
 
 class Attention(nn.Module):
-    def __init__(self, dim, heads = 4, dim_head = 32):
+    def __init__(self, dim, heads=4, dim_head=32):
         super().__init__()
-        self.scale = dim_head ** -0.5
+        self.scale = dim_head**-0.5
         self.heads = heads
         hidden_dim = dim_head * heads
-        self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias = False)
+        self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias=False)
         self.to_out = nn.Conv2d(hidden_dim, dim, 1)
 
     def forward(self, x):
         b, c, h, w = x.shape
-        qkv = self.to_qkv(x).chunk(3, dim = 1)
-        q, k, v = map(lambda t: rearrange(t, 'b (h c) x y -> b h c (x y)', h = self.heads), qkv)
+        qkv = self.to_qkv(x).chunk(3, dim=1)
+        q, k, v = map(
+            lambda t: rearrange(t, "b (h c) x y -> b h c (x y)", h=self.heads), qkv
+        )
         q = q * self.scale
 
-        sim = einsum('b h d i, b h d j -> b h i j', q, k)
-        sim = sim - sim.amax(dim = -1, keepdim = True).detach()
-        attn = sim.softmax(dim = -1)
+        sim = einsum("b h d i, b h d j -> b h i j", q, k)
+        sim = sim - sim.amax(dim=-1, keepdim=True).detach()
+        attn = sim.softmax(dim=-1)
 
-        out = einsum('b h i j, b h d j -> b h i d', attn, v)
-        out = rearrange(out, 'b h (x y) d -> b (h d) x y', x = h, y = w)
+        out = einsum("b h i j, b h d j -> b h i d", attn, v)
+        out = rearrange(out, "b h (x y) d -> b (h d) x y", x=h, y=w)
         return self.to_out(out)
 
-# model
+class LinearAttention(nn.Module):
+    def __init__(self, dim, heads=4, dim_head=32):
+        super().__init__()
+        self.scale = dim_head**-0.5
+        self.heads = heads
+        hidden_dim = dim_head * heads
+        self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias=False)
+
+        self.to_out = nn.Sequential(nn.Conv2d(hidden_dim, dim, 1), 
+                                    nn.GroupNorm(1, dim))
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        qkv = self.to_qkv(x).chunk(3, dim=1)
+        q, k, v = map(
+            lambda t: rearrange(t, "b (h c) x y -> b h c (x y)", h=self.heads), qkv
+        )
+
+        q = q.softmax(dim=-2)
+        k = k.softmax(dim=-1)
+
+        q = q * self.scale
+        context = torch.einsum("b h d n, b h e n -> b h d e", k, v)
+
+        out = torch.einsum("b h d e, b h d n -> b h e n", context, q)
+        out = rearrange(out, "b h c (x y) -> b (h c) x y", h=self.heads, x=h, y=w)
+        return self.to_out(out)
+
+class PreNorm(nn.Module):
+    def __init__(self, dim, fn):
+        super().__init__()
+        self.fn = fn
+        self.norm = nn.GroupNorm(1, dim)
+
+    def forward(self, x):
+        x = self.norm(x)
+        return self.fn(x)
+
 
 class Unet(nn.Module):
     def __init__(
         self,
         dim,
-        init_dim = None,
-        out_dim = None,
+        init_dim=None,
+        out_dim=None,
         dim_mults=(1, 2, 4, 8),
-        channels = 3,
-        with_time_emb = True,
-        resnet_block_groups = 8,
-        learned_variance = False
+        channels=3,
+        with_time_emb=True,
+        resnet_block_groups=8,
+        use_convnext=True,
+        convnext_mult=2,
+        learned_variance=False,
     ):
         super().__init__()
 
         # determine dimensions
-
         self.channels = channels
 
         init_dim = default(init_dim, dim // 3 * 2)
-        self.init_conv = nn.Conv2d(channels, init_dim, 7, padding = 3)
+        self.init_conv = nn.Conv2d(channels, init_dim, 7, padding=3)
 
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
-
-        block_klass = partial(ResnetBlock, groups = resnet_block_groups)
+        
+        if use_convnext:
+            block_klass = partial(ConvNextBlock, mult=convnext_mult)
+        else:
+            block_klass = partial(ResnetBlock, groups=resnet_block_groups)
 
         # time embeddings
-
         if with_time_emb:
             time_dim = dim * 4
             self.time_mlp = nn.Sequential(
-                SinusoidalPosEmb(dim),
+                SinusoidalPositionEmbeddings(dim),
                 nn.Linear(dim, time_dim),
                 nn.GELU(),
-                nn.Linear(time_dim, time_dim)
+                nn.Linear(time_dim, time_dim),
             )
         else:
             time_dim = None
             self.time_mlp = None
 
         # layers
-
         self.downs = nn.ModuleList([])
         self.ups = nn.ModuleList([])
         num_resolutions = len(in_out)
@@ -277,45 +324,52 @@ class Unet(nn.Module):
         for ind, (dim_in, dim_out) in enumerate(in_out):
             is_last = ind >= (num_resolutions - 1)
 
-            self.downs.append(nn.ModuleList([
-                block_klass(dim_in, dim_out, time_emb_dim = time_dim),
-                block_klass(dim_out, dim_out, time_emb_dim = time_dim),
-                Residual(PreNorm(dim_out, LinearAttention(dim_out))),
-                Downsample(dim_out) if not is_last else nn.Identity()
-            ]))
+            self.downs.append(
+                nn.ModuleList(
+                    [
+                        block_klass(dim_in, dim_out, time_emb_dim=time_dim),
+                        block_klass(dim_out, dim_out, time_emb_dim=time_dim),
+                        Residual(PreNorm(dim_out, LinearAttention(dim_out))),
+                        Downsample(dim_out) if not is_last else nn.Identity(),
+                    ]
+                )
+            )
 
         mid_dim = dims[-1]
-        self.mid_block1 = block_klass(mid_dim, mid_dim, time_emb_dim = time_dim)
+        self.mid_block1 = block_klass(mid_dim, mid_dim, time_emb_dim=time_dim)
         self.mid_attn = Residual(PreNorm(mid_dim, Attention(mid_dim)))
-        self.mid_block2 = block_klass(mid_dim, mid_dim, time_emb_dim = time_dim)
+        self.mid_block2 = block_klass(mid_dim, mid_dim, time_emb_dim=time_dim)
 
         for ind, (dim_in, dim_out) in enumerate(reversed(in_out[1:])):
             is_last = ind >= (num_resolutions - 1)
 
-            self.ups.append(nn.ModuleList([
-                block_klass(dim_out * 2, dim_in, time_emb_dim = time_dim),
-                block_klass(dim_in, dim_in, time_emb_dim = time_dim),
-                Residual(PreNorm(dim_in, LinearAttention(dim_in))),
-                Upsample(dim_in) if not is_last else nn.Identity()
-            ]))
+            self.ups.append(
+                nn.ModuleList(
+                    [
+                        block_klass(dim_out * 2, dim_in, time_emb_dim=time_dim),
+                        block_klass(dim_in, dim_in, time_emb_dim=time_dim),
+                        Residual(PreNorm(dim_in, LinearAttention(dim_in))),
+                        Upsample(dim_in) if not is_last else nn.Identity(),
+                    ]
+                )
+            )
 
         default_out_dim = channels * (1 if not learned_variance else 2)
         self.out_dim = default(out_dim, default_out_dim)
-
         self.final_conv = nn.Sequential(
-            block_klass(dim, dim),
-            nn.Conv2d(dim, self.out_dim, 1)
+            block_klass(dim, dim), nn.Conv2d(dim, self.out_dim, 1)
         )
 
+        
+
     def forward(self, x, time):
-        """ This function is going to start with x_t and attempt to predict x_(t-1) (I think)
-        """
         x = self.init_conv(x)
 
         t = self.time_mlp(time) if exists(self.time_mlp) else None
 
         h = []
 
+        # downsample
         for block1, block2, attn, downsample in self.downs:
             x = block1(x, t)
             x = block2(x, t)
@@ -323,16 +377,19 @@ class Unet(nn.Module):
             h.append(x)
             x = downsample(x)
 
+        # bottleneck
         x = self.mid_block1(x, t)
         x = self.mid_attn(x)
         x = self.mid_block2(x, t)
 
+        # upsample
         for block1, block2, attn, upsample in self.ups:
-
-            if (x.shape[-2],x.shape[-1]) != (h[-1].shape[-2],h[-1].shape[-1]): # we may have to perform some padding to avoid potential for mismatched dimensions when upsampling
+            
+            # we may have to perform some padding to avoid potential for mismatched dimensions when upsampling
+            if (x.shape[-2],x.shape[-1]) != (h[-1].shape[-2],h[-1].shape[-1]): 
                 padding = np.array([h[-1].shape[-2],h[-1].shape[-1]]) - np.array([x.shape[-2],x.shape[-1]])
                 x = nn.ZeroPad2d((padding[0],0,padding[-1],0))(x)
-            
+
             x = torch.cat((x, h.pop()), dim=1)
             x = block1(x, t)
             x = block2(x, t)
@@ -340,7 +397,7 @@ class Unet(nn.Module):
             x = upsample(x)
 
         return self.final_conv(x)
-
+        
 # gaussian diffusion trainer class
 
 def extract(a, t, x_shape):
@@ -353,23 +410,33 @@ def noise_like(shape, device, repeat=False):
     noise = lambda: torch.randn(shape, device=device)
     return repeat_noise() if repeat else noise()
 
-def linear_beta_schedule(timesteps):
-    scale = 1000 / timesteps
-    beta_start = scale * 0.0001
-    beta_end = scale * 0.02
-    return torch.linspace(beta_start, beta_end, timesteps, dtype = torch.float64)
-
-def cosine_beta_schedule(timesteps, s = 0.008):
+def cosine_beta_schedule(timesteps, s=0.008):
     """
-    cosine schedule
-    as proposed in https://openreview.net/forum?id=-NEXDKk8gZ
+    cosine schedule as proposed in https://arxiv.org/abs/2102.09672
     """
     steps = timesteps + 1
-    x = torch.linspace(0, timesteps, steps, dtype = torch.float64)
+    x = torch.linspace(0, timesteps, steps)
     alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * torch.pi * 0.5) ** 2
     alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-    return torch.clip(betas, 0, 0.999)
+    return torch.clip(betas, 0.0001, 0.9999)
+
+def linear_beta_schedule(timesteps):
+    beta_start = 0.0001
+    beta_end = 0.02
+    return torch.linspace(beta_start, beta_end, timesteps)
+
+def quadratic_beta_schedule(timesteps):
+    beta_start = 0.0001
+    beta_end = 0.02
+    return torch.linspace(beta_start**0.5, beta_end**0.5, timesteps) ** 2
+
+def sigmoid_beta_schedule(timesteps):
+    beta_start = 0.0001
+    beta_end = 0.02
+    betas = torch.linspace(-6, 6, timesteps)
+    return torch.sigmoid(betas) * (beta_end - beta_start) + beta_start
+
 
 class GaussianDiffusion(nn.Module):
     def __init__(
@@ -391,6 +458,7 @@ class GaussianDiffusion(nn.Module):
         self.denoise_fn = denoise_fn
         self.objective = objective
 
+        # define the beta schedule
         if beta_schedule == 'linear':
             betas = linear_beta_schedule(timesteps)
         elif beta_schedule == 'cosine':
@@ -398,6 +466,7 @@ class GaussianDiffusion(nn.Module):
         else:
             raise ValueError(f'unknown beta schedule {beta_schedule}')
 
+        # define alphas 
         alphas = 1. - betas
         alphas_cumprod = torch.cumprod(alphas, axis=0)
         alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value = 1.) # this is same as above, but just one value before alphahat_(t-1)
@@ -415,7 +484,6 @@ class GaussianDiffusion(nn.Module):
         register_buffer('alphas_cumprod_prev', alphas_cumprod_prev)
 
         # calculations for diffusion q(x_t | x_{t-1}) and others
-
         register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
         register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - alphas_cumprod))
         register_buffer('log_one_minus_alphas_cumprod', torch.log(1. - alphas_cumprod))
@@ -468,17 +536,35 @@ class GaussianDiffusion(nn.Module):
         return model_mean, posterior_variance, posterior_log_variance
 
     @torch.no_grad()
-    def p_sample(self, x, t, clip_denoised, repeat_noise=False, mask=None):
+    def p_sample(self, x, t_index, repeat_noise=False, mask=None):
         b, *_, device = *x.shape, x.device
-        model_mean, _, model_log_variance = self.p_mean_variance(x=x, t=t, clip_denoised=clip_denoised)
+
+        # initialize variables
+        t = torch.full((b,), t_index, device=device, dtype=torch.long)
+        betas_t = extract(self.betas, t, x.shape)
+        sqrt_one_minus_alphas_cumprod_t = extract(self.sqrt_one_minus_alphas_cumprod, t, x.shape)
+
+        sqrt_recip_alphas_t = 1 / torch.sqrt((1. - betas_t))
+        model = self.denoise_fn
+
+        # Equation 11 in the paper; use model (noise predictor) to predict the mean
+        model_mean = sqrt_recip_alphas_t * (x - betas_t * model(x, t) / sqrt_one_minus_alphas_cumprod_t)
         noise = noise_like(x.shape, device, repeat_noise)
-        # no noise when t == 0
-        nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(x.shape) - 1)))
 
         # this allows for inpainting 
         if mask is not None:
             model_mean[mask] = x[mask]
             noise[mask] = 0.
+
+        if t_index == 0:
+            return model_mean
+        else:
+            posterior_variance_t = extract(self.posterior_variance, t, x.shape)
+            
+            # Algorithm 2 line 4:
+            return model_mean + torch.sqrt(posterior_variance_t) * noise 
+
+        
 
         return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
 
@@ -519,11 +605,11 @@ class GaussianDiffusion(nn.Module):
             plt.figure()
         
         for i in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
-            img = self.p_sample(img, torch.full((b,), i, device=device, dtype=torch.long), clip_denoised=clip_denoised, mask=mask)
+            img = self.p_sample(img, i, mask=mask)
 
             if plot_flag:
                 if not i%10:
-                    plot_im_list(img.cpu()[:,0]);plt.show(block=False);plt.waitforbuttonpress();plt.close('all')
+                    plt.imshow(img[0].cpu()[0,:,:],vmin=0,vmax=1);plt.show(block=False);plt.waitforbuttonpress()
 
             if output_folder is not None:
                 if not i%10: # save every 10th sample
@@ -533,31 +619,8 @@ class GaussianDiffusion(nn.Module):
                         os.mkdir(output_folder)
                         utils.save_image(img, output_folder + '\\' + f'im_{self.num_timesteps - i:04d}.png',nrow=int(img.shape[0]**0.5)) 
 
-        img = unnormalize_to_zero_to_one(img) # This is included so that the image sample can be saved and not have any colors clipped I believe
+        # img = unnormalize_to_zero_to_one(img) # This is included so that the image sample can be saved and not have any colors clipped I believe
         return img
-
-    @torch.no_grad()
-    def my_sample(self, shape):
-        self.device = self.betas.device
-        x = torch.randn(shape).to(self.device)
-        n = shape[0]
-        for i in tqdm(reversed(range(1, self.num_timesteps)), position=0):
-            t = (torch.ones(n) * i).long().to(self.device)
-            predicted_noise = self.denoise_fn(x, t)
-            beta = extract(self.betas, t, x.shape)
-            alpha_hat = extract(self.alphas_cumprod, t, x.shape)
-            alpha = 1. - beta
-            if i > 1:
-                noise = torch.randn_like(x)
-            else:
-                noise = torch.zeros_like(x)
-            x = 1 / torch.sqrt(alpha) * (x - ((1 - alpha) / (torch.sqrt(1 - alpha_hat))) * predicted_noise) + torch.sqrt(beta) * noise
-            x = x.clamp(-1., 1.)
-
-            # if i % 20 == 0:
-            #     plot_im_list(x.cpu()[:,0])
-            
-        return x.add(1).mul(0.5)
 
     @torch.no_grad()
     def p_sample_step(self, shape, clip_denoised, t, img, mask, plot_flag=False,output_folder=None):
@@ -702,12 +765,8 @@ class GaussianDiffusion(nn.Module):
         # calculate PSNR for batch
         PSNR, PSNR_bc = [], []
         for i in range(0,batch_size):
-            mse = torch.mean((new_sample[i].to(device) - images[i]) ** 2)
-            psnr = 10 * torch.log10(1 / mse)
-            mse_bc = torch.mean((bc_out[i] - images[i])**2)
-            psnr_bc = 10 * torch.log10(1 / mse_bc)
-            PSNR.append(psnr)
-            PSNR_bc.append(psnr_bc)
+            PSNR.append(psnr(new_sample[i].squeeze().to(device), images.squeeze()[i]))
+            PSNR_bc.append(psnr(bc_out[i].squeeze(), images.squeeze()[i]))
 
         return torch.tensor(PSNR), torch.tensor(PSNR_bc)
 
@@ -731,11 +790,10 @@ class GaussianDiffusion(nn.Module):
 
     def q_sample(self, x_start, t, noise=None):
         noise = default(noise, lambda: torch.randn_like(x_start)) # x_start is x_0 in the paper (I think)
+        sqrt_alphas_cumprod_t = extract(self.sqrt_alphas_cumprod, t, x_start.shape) # [batch_size, 1 , 1, 1]
+        sqrt_one_minus_alphas_cumprod_t = extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) # [batch_size, 1, 1, 1]
 
-        return ( # this is related to equation 4 in the paper, DDPM Ho et. al 2020; equation 9 in Nichol et. al 2021
-            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start + # [batch_size, 1 , 1, 1] x [batch_size, C, X, Y]
-            extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise # [batch_size, 1, 1, 1] x [batch_size, C, X, Y]
-        )
+        return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise # this is related to equation 4 in the paper, DDPM Ho et. al 2020; equation 9 in Nichol et. al 2021
 
     @property
     def loss_fn(self):
@@ -743,6 +801,8 @@ class GaussianDiffusion(nn.Module):
             return F.l1_loss
         elif self.loss_type == 'l2':
             return F.mse_loss
+        elif self.loss_type == "huber":
+            return F.smooth_l1_loss
         else:
             raise ValueError(f'invalid loss type {self.loss_type}')
 
@@ -750,8 +810,8 @@ class GaussianDiffusion(nn.Module):
         b, c, h, w = x_start.shape
         noise = default(noise, lambda: torch.randn_like(x_start))
 
-        x = self.q_sample(x_start=x_start, t=t, noise=noise) # returns x_t given x_0 (equation 4 in Ho et. al 2020)
-        model_out = self.denoise_fn(x, t)
+        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise) # returns x_t given x_0 (equation 4 in Ho et. al 2020)
+        model_out = self.denoise_fn(x_noisy, t)
 
         if self.objective == 'pred_noise':
             target = noise
@@ -760,8 +820,7 @@ class GaussianDiffusion(nn.Module):
         else:
             raise ValueError(f'unknown objective {self.objective}')
 
-        loss = self.loss_fn(model_out, target)
-        return loss
+        return self.loss_fn(model_out, target)
 
     def forward(self, img, *args, **kwargs):
         b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
@@ -796,7 +855,8 @@ class Dataset(data.Dataset):
                     transforms.Resize(image_size),
                     transforms.RandomHorizontalFlip(),
                     transforms.CenterCrop(image_size),
-                    transforms.ToTensor()
+                    transforms.ToTensor(),
+                    # transforms.Lambda(lambda t: (t * 2) - 1), # you may have to add this for image data
                 ])
 
     def __len__(self):
@@ -932,11 +992,12 @@ class Trainer(object):
         with tqdm(initial = self.step, total = self.train_num_steps) as pbar: # this controls the progress bar
 
             while self.step < self.train_num_steps: # this controls how long the model trains for 
+                self.opt.zero_grad()
                 for i in range(self.gradient_accumulate_every): # idut
                     data = next(self.dl).cuda() # loads a batch into cuda torch tensor object
 
                     with autocast(enabled = self.amp):
-                        loss = self.model(data) # i don't understand how this calculates the loss
+                        loss = self.model(data)
                         data =  next(self.val_dl).cuda()
                         val_loss = self.model(data)
                         self.scaler.scale(loss / self.gradient_accumulate_every).backward() # idut
@@ -996,8 +1057,9 @@ class Trainer(object):
                         # save checkpoint if PSNR is higher than previous
                         if self.step > self.save_and_sample_every:
                             PSNR_max = np.max(pd.read_csv(str(self.model_folder / f'PSNR_mean.csv')).iloc[0:-1,-1])
+                            PSNR_bc_max = np.max(pd.read_csv(str(self.model_folder / f'PSNR_bc_mean.csv')).iloc[0:-1,-1])
                             
-                            if PSNR_mean >= PSNR_max:
+                            if PSNR_mean - PSNR_bc_mean >= PSNR_max - PSNR_bc_max:
                                 self.save(f'PSNR-ckpt')
 
                 self.step += 1
